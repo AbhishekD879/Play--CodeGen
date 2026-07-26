@@ -62,6 +62,35 @@ EM_JS(void, WasmDeleteFunction, (int fctId),
 {
 	removeFunction(fctId);
 });
+
+//>>> PLAYSTATION-PORTFOLIO LAST MODULE
+// Keep a copy of the most recently generated module. When the codegen emits
+// something the browser refuses, the failing module is by definition the last
+// one produced — and because pthreads give us a SharedArrayBuffer, the main
+// thread can read this buffer even though codegen runs on the VM worker.
+namespace PortfolioLastModule
+{
+	const size_t CAP = 64 * 1024;
+	uint8_t bytes[CAP];
+	uint32_t size = 0;
+	uint32_t count = 0;
+}
+//<<< PLAYSTATION-PORTFOLIO LAST MODULE
+
+//>>> PLAYSTATION-PORTFOLIO JIT STATS
+// Unlike a native JIT, which writes bytes into an executable page in
+// microseconds, every recompiled block here becomes its own WebAssembly module
+// that the browser compiles synchronously on the calling thread. That cost is
+// the difference between a game that runs and one that stutters, and nothing
+// outside the emulator can see it — so count it here.
+namespace PortfolioJitStats
+{
+	uint64_t blocksCompiled = 0;   // cumulative, never reset
+	uint64_t blocksLive = 0;       // compiled minus freed
+	uint64_t codeBytes = 0;        // total generated wasm handed to the browser
+	double compileMs = 0.0;        // wall time spent inside WebAssembly.Module/Instance
+}
+//<<< PLAYSTATION-PORTFOLIO JIT STATS
 EM_JS(emscripten::EM_VAL, WasmCreateModule, (uintptr_t code, uintptr_t size),
 {
 	//var fs = require('fs');
@@ -73,8 +102,18 @@ EM_JS(emscripten::EM_VAL, WasmCreateModule, (uintptr_t code, uintptr_t size),
 	//	let url = URL.createObjectURL(blob);
 	//	console.log(url);
 	//}
-	let module = new WebAssembly.Module(moduleBytes);
-	return Emval.toHandle(module);
+	//>>> PLAYSTATION-PORTFOLIO CODEGEN DUMP
+	// When the generated module is malformed the browser rejects it and the VM
+	// dies with a CompileError that names a byte offset and nothing else. Keep
+	// the bytes so the offending function can actually be disassembled.
+	try {
+		let module = new WebAssembly.Module(moduleBytes);
+		return Emval.toHandle(module);
+	} catch(e) {
+		console.error(`CODEGEN invalid module ${size}B: ${e}`);
+		throw e;
+	}
+	//<<< PLAYSTATION-PORTFOLIO CODEGEN DUMP
 });
 #else
 #error "No API to use for CMemoryFunction"
@@ -129,9 +168,26 @@ CMemoryFunction::CMemoryFunction(const void* code, size_t size)
 	pthread_jit_write_protect_np(true);
 #endif
 #elif defined(MEMFUNC_USE_WASM)
+	//>>> PLAYSTATION-PORTFOLIO LAST MODULE
+	if(size <= PortfolioLastModule::CAP)
+	{
+		memcpy(PortfolioLastModule::bytes, code, size);
+		PortfolioLastModule::size = static_cast<uint32_t>(size);
+		PortfolioLastModule::count++;
+	}
+	//<<< PLAYSTATION-PORTFOLIO LAST MODULE
+	//>>> PLAYSTATION-PORTFOLIO JIT STATS
+	double portfolioT0 = emscripten_get_now();
+	//<<< PLAYSTATION-PORTFOLIO JIT STATS
 	m_wasmModule = emscripten::val::take_ownership(WasmCreateModule(reinterpret_cast<uintptr_t>(code), size));
 	m_size = size;
 	m_code = reinterpret_cast<void*>(WasmCreateFunction(m_wasmModule.as_handle()));
+	//>>> PLAYSTATION-PORTFOLIO JIT STATS
+	PortfolioJitStats::compileMs += emscripten_get_now() - portfolioT0;
+	PortfolioJitStats::blocksCompiled++;
+	PortfolioJitStats::blocksLive++;
+	PortfolioJitStats::codeBytes += size;
+	//<<< PLAYSTATION-PORTFOLIO JIT STATS
 #endif
 	ClearCache();
 #if !defined(MEMFUNC_USE_WASM)
@@ -167,6 +223,9 @@ void CMemoryFunction::Reset()
 		munmap(m_code, m_size);
 #elif defined(MEMFUNC_USE_WASM)
 		WasmDeleteFunction(reinterpret_cast<int>(m_code));
+		//>>> PLAYSTATION-PORTFOLIO JIT STATS
+		if(PortfolioJitStats::blocksLive > 0) PortfolioJitStats::blocksLive--;
+		//<<< PLAYSTATION-PORTFOLIO JIT STATS
 #endif
 	}
 	m_code = nullptr;
