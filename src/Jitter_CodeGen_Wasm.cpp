@@ -169,16 +169,16 @@ CCodeGen_Wasm::CONSTMATCHER CCodeGen_Wasm::g_constMatchers[] =
 
 #include <emscripten.h>
 // clang-format off
-EM_JS_DEPS(WasmRegisterExternFunction, "$convertJsFunctionToWasm");
-EM_JS(int, RegisterExternFunction, (const char* functionName, const char* functionSig), {
-	let fctName = UTF8ToString(functionName);
-	let fctSig = UTF8ToString(functionSig);
-	let fct = Module[fctName];
-	if(fct === undefined)
+EM_JS_DEPS(WasmRegisterExternFunction, "$wasmTable");
+// A host function pointer in wasm IS an index into the module's indirect function
+// table, so the real funcref can go straight into the import table. The previous
+// path fetched Module["_name"] — a JS wrapper around the wasm export — and ran it
+// back through convertJsFunctionToWasm, so every host call crossed the JS boundary
+// twice. That is paid per call, and with the TLB enabled the recompiler emits one
+// such call per load/store, which is why a TLB game ran at under half speed.
+EM_JS(int, RegisterExternFunction, (uint32_t functionPtr, const char* functionName), {
+	if(Module.codeGenImportTable === undefined)
 	{
-		out(`Warning: Could not find function '${fctName}' (missing export?).`);
-	}
-	if(Module.codeGenImportTable === undefined) {
 		out("Creating import table...");
 		Module.codeGenImportTable = new WebAssembly.Table({
 			element: 'anyfunc',
@@ -186,17 +186,37 @@ EM_JS(int, RegisterExternFunction, (const char* functionName, const char* functi
 		});
 		Module.codeGenImportTableNextIndex = 0;
 	}
-	//TODO: Check how we can use the export from the WASM module directly
-	//instead of having to wrap the wrapper
-	let wrappedFct = convertJsFunctionToWasm(fct, fctSig);
+	let fctName = UTF8ToString(functionName);
+	let fct = wasmTable.get(functionPtr);
+	if(!fct)
+	{
+		out(`Warning: no table entry for '${fctName}' at pointer ${functionPtr}.`);
+	}
 	let fctId = Module.codeGenImportTableNextIndex++;
-	Module.codeGenImportTable.set(fctId, wrappedFct);
-	out(`Registered function '${fctName}(${fctSig})' = > id = ${fctId}.`);
+	if(fctId >= Module.codeGenImportTable.length)
+	{
+		Module.codeGenImportTable.grow(32);
+	}
+	Module.codeGenImportTable.set(fctId, fct);
+	out(`Registered '${fctName}' ptr ${functionPtr} = > id = ${fctId}.`);
 	return fctId;
 });
 // clang-format on
 
 std::map<uintptr_t, CWasmFunctionRegistry::WASM_FUNCTION_INFO> CWasmFunctionRegistry::m_functions;
+
+//>>> PLAYSTATION-PORTFOLIO MISSING FUNCTION
+// A host function the recompiler calls but nobody registered. Both callers
+// dereference the result of FindFunction without checking, so in a release
+// build (asserts compiled out) a miss is a null dereference that reads zeros —
+// which emits call_indirect with signature index 0 and table index 0, and the
+// browser rejects the module. Record the pointer so the culprit can be named.
+namespace PortfolioMissingFct
+{
+	uint32_t ptr = 0;
+	uint32_t count = 0;
+}
+//<<< PLAYSTATION-PORTFOLIO MISSING FUNCTION
 
 void CWasmFunctionRegistry::RegisterFunction(uintptr_t functionPtr, const char* functionName, const char* functionSig)
 {
@@ -205,7 +225,9 @@ void CWasmFunctionRegistry::RegisterFunction(uintptr_t functionPtr, const char* 
 		assert(fctIterator == m_functions.end());
 	}
 	WASM_FUNCTION_INFO functionInfo;
-	functionInfo.id = RegisterExternFunction(functionName, functionSig);
+	// The signature is still needed for the call_indirect type index; only the
+	// table entry changes, and it is now the function itself.
+	functionInfo.id = RegisterExternFunction(static_cast<uint32_t>(functionPtr), functionName);
 	functionInfo.signature = functionSig;
 	m_functions.insert(std::make_pair(functionPtr, functionInfo));
 }
@@ -213,7 +235,14 @@ void CWasmFunctionRegistry::RegisterFunction(uintptr_t functionPtr, const char* 
 const CWasmFunctionRegistry::WASM_FUNCTION_INFO* CWasmFunctionRegistry::FindFunction(uintptr_t functionPtr)
 {
 	auto fctIterator = m_functions.find(functionPtr);
-	if(fctIterator == std::end(m_functions)) return nullptr;
+	if(fctIterator == std::end(m_functions))
+	{
+		//>>> PLAYSTATION-PORTFOLIO MISSING FUNCTION
+		PortfolioMissingFct::ptr = static_cast<uint32_t>(functionPtr);
+		PortfolioMissingFct::count++;
+		//<<< PLAYSTATION-PORTFOLIO MISSING FUNCTION
+		return nullptr;
+	}
 	return &fctIterator->second;
 }
 
@@ -535,6 +564,15 @@ void CCodeGen_Wasm::PrepareSignatures(CWasmModuleBuilder& moduleBuilder, const S
 		assert(src1->m_type == SYM_CONSTANTPTR);
 
 		auto fctInfo = CWasmFunctionRegistry::FindFunction(src1->m_valueLow);
+		if(!fctInfo)
+		{
+			// Reading through a null registration is what turned an unregistered
+			// callable into "invalid wasm module": signature index 0 and table
+			// index 0 both come from the zeroed read. Name the culprit instead.
+			printf("Jitter_CodeGen_Wasm: function pointer %u is not registered.\r\n",
+			       static_cast<uint32>(src1->m_valueLow));
+			abort();
+		}
 		assert(fctInfo);
 
 		assert(!fctInfo->signature.empty());
@@ -1112,6 +1150,15 @@ void CCodeGen_Wasm::Emit_Call(const STATEMENT& statement)
 	}
 
 	auto fctInfo = CWasmFunctionRegistry::FindFunction(src1->m_valueLow);
+	if(!fctInfo)
+	{
+		// Reading through a null registration is what turned an unregistered
+		// callable into "invalid wasm module": signature index 0 and table
+		// index 0 both come from the zeroed read. Name the culprit instead.
+		printf("Jitter_CodeGen_Wasm: function pointer %u is not registered.\r\n",
+		       static_cast<uint32>(src1->m_valueLow));
+		abort();
+	}
 	auto sigIdxIterator = m_signatures.find(fctInfo->signature);
 	assert(sigIdxIterator != std::end(m_signatures));
 	auto sigIdx = sigIdxIterator->second;
@@ -1144,6 +1191,15 @@ void CCodeGen_Wasm::Emit_ExternJmp(const STATEMENT& statement)
 	PushContext();
 
 	auto fctInfo = CWasmFunctionRegistry::FindFunction(src1->m_valueLow);
+	if(!fctInfo)
+	{
+		// Reading through a null registration is what turned an unregistered
+		// callable into "invalid wasm module": signature index 0 and table
+		// index 0 both come from the zeroed read. Name the culprit instead.
+		printf("Jitter_CodeGen_Wasm: function pointer %u is not registered.\r\n",
+		       static_cast<uint32>(src1->m_valueLow));
+		abort();
+	}
 	auto sigIdxIterator = m_signatures.find(fctInfo->signature);
 	assert(sigIdxIterator != std::end(m_signatures));
 	auto sigIdx = sigIdxIterator->second;
