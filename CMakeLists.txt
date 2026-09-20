@@ -255,6 +255,17 @@ if(EMSCRIPTEN)
 	target_link_options(CodeGenTestSuite PRIVATE "-sWASM_BIGINT")
 	target_link_options(CodeGenTestSuite PRIVATE "-sEXPORTED_FUNCTIONS=['_main', '_CCrc32Test_GetNextByte', '_CCrc32Test_GetTableValue', '_CCall64Test_Add64', '_CCall64Test_Sub64', '_CCall64Test_AddMul64', '_CCall64Test_AddMul64_2', '_RegAllocTempTest_DummyFunction']")
 	target_link_options(CodeGenTestSuite PRIVATE "-sALLOW_TABLE_GROWTH")
-	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fexceptions")
+	#>>> PLAYSTATION-PORTFOLIO WASM EH
+	# This re-appends what Header.cmake already set, in this directory's own
+	# scope. Harmless while both say -fexceptions, but a parent that selected
+	# native wasm EH would get -fexceptions put back for the recompiler's own
+	# objects only — and wasm EH cannot be mixed across objects, so the link
+	# fails. Follow the parent's choice instead of restating the default.
+	if(PORTFOLIO_WASM_EH)
+		set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fwasm-exceptions")
+	else()
+		set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fexceptions")
+	endif()
+	#<<< PLAYSTATION-PORTFOLIO WASM EH
 	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread")
 endif()
